@@ -1,15 +1,21 @@
 import requests
 from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext, ApplicationBuilder
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackContext,
+    ContextTypes
+)
 import logging
-from datetime import datetime
+from datetime import datetime, time
 import os
 from dotenv import load_dotenv
-# Конфигурация
+import pytz
+import asyncio
 
+# Конфигурация
 load_dotenv()
 
-# Конфигурация
 REPORTPORTAL_URL = "https://reportportal.a2nta.ru"
 AUTH_URL = f"{REPORTPORTAL_URL}/uat/sso/oauth/token"
 LAUNCHES_URL = f"{REPORTPORTAL_URL}/api/v1/superadmin_personal/launch"
@@ -26,13 +32,15 @@ AUTH_DATA = {
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
+# Время ежедневного отчета (09:00 по Москве)
+DAILY_REPORT_TIME = time(hour=9, minute=0, tzinfo=pytz.timezone('Europe/Moscow'))
+
 # Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-
 
 def get_access_token():
     """Получаем access_token от ReportPortal"""
@@ -43,7 +51,6 @@ def get_access_token():
     except Exception as e:
         logger.error(f"Ошибка при получении токена: {e}")
         return None
-
 
 def get_filtered_launches(access_token):
     """Получаем и фильтруем запуски, возвращаем последние для 3.30 и 3.29"""
@@ -113,7 +120,6 @@ def get_filtered_launches(access_token):
         logger.error(f"Ошибка при получении запусков: {e}")
         return []
 
-
 def format_statistics(launch):
     """Форматируем статистику для вывода"""
     stats = launch.get("statistics", {}).get("executions", {})
@@ -138,11 +144,8 @@ def format_statistics(launch):
         f"Ссылка на запуск: {REPORTPORTAL_URL}/ui/#superadmin_personal/launches/all/{launch.get('id')}\n"
     )
 
-
-async def send_report(update: Update, context: CallbackContext):
-    """Обработчик команды /report"""
-    chat_id = update.effective_chat.id
-
+async def send_report_to_chat(context: CallbackContext, chat_id: int):
+    """Функция для отправки отчета в указанный чат"""
     try:
         # Получаем токен
         access_token = get_access_token()
@@ -162,8 +165,8 @@ async def send_report(update: Update, context: CallbackContext):
             await context.bot.send_message(chat_id=chat_id, text=message)
 
         versions_found = ", ".join([attr.get("value") for launch in launches
-                                    for attr in launch.get("attributes", [])
-                                    if attr.get("key") == "FullVersion"])
+                                  for attr in launch.get("attributes", [])
+                                  if attr.get("key") == "FullVersion"])
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"Отчет по последним запускам версий: {versions_found}"
@@ -173,25 +176,37 @@ async def send_report(update: Update, context: CallbackContext):
         logger.error(f"Ошибка при отправке отчета: {e}")
         await context.bot.send_message(chat_id=chat_id, text=f"Произошла ошибка: {e}")
 
+async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /report"""
+    await send_report_to_chat(context, update.effective_chat.id)
+
+async def daily_report(context: CallbackContext):
+    """Ежедневная отправка отчета"""
+    await send_report_to_chat(context, TELEGRAM_CHAT_ID)
+
+async def post_init(application):
+    """Действия после инициализации бота"""
+    # Устанавливаем ежедневный отчет
+    job_queue = application.job_queue
+    job_queue.run_daily(daily_report, time=DAILY_REPORT_TIME)
+
+    # Отправляем отчет сразу при запуске
+    await daily_report(application)
 
 def main():
     """Запуск бота"""
-    # Создаем приложение
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    # Убедитесь, что установили пакет с job-queue:
+    # pip install python-telegram-bot[job-queue]
+    application = ApplicationBuilder() \
+        .token(TELEGRAM_TOKEN) \
+        .post_init(post_init) \
+        .build()
 
-    # Регистрируем обработчики команд
-    application.add_handler(CommandHandler("report", send_report))
-
-    # Отправляем статистику сразу при запуске
-    async def send_initial_report():
-        chat_id = TELEGRAM_CHAT_ID  # Используем ID чата из переменных окружения
-        await send_report(chat_id)
+    # Регистрируем обработчик команды
+    application.add_handler(CommandHandler("report", report_command))
 
     # Запускаем бота
     application.run_polling()
-
-    # Отправляем отчет
-    application.run_async(send_initial_report)
 
 if __name__ == '__main__':
     main()
