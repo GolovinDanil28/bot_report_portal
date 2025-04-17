@@ -182,9 +182,16 @@ def main():
     # Регистрируем обработчики команд
     application.add_handler(CommandHandler("report", send_report))
 
+    # Отправляем статистику сразу при запуске
+    async def send_initial_report():
+        chat_id = TELEGRAM_CHAT_ID  # Используем ID чата из переменных окружения
+        await send_report(chat_id)
+
     # Запускаем бота
     application.run_polling()
 
+    # Отправляем отчет
+    application.run_async(send_initial_report)
 
 if __name__ == '__main__':
     main()
