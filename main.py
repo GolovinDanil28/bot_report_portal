@@ -1,4 +1,5 @@
 import requests
+import telegram
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -41,15 +42,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 def get_access_token():
     """Получаем access_token от ReportPortal"""
     try:
         response = requests.post(AUTH_URL, headers=AUTH_HEADERS, data=AUTH_DATA)
         response.raise_for_status()
-        return response.json()["access_token"]
+
+        logger.info("Токен успешно получен.")
+        return response.json().get("access_token")
+    except requests.exceptions.HTTPError as http_err:
+        logger.error(f"HTTP ошибка при получении токена: {http_err}")
+        if response:
+            logger.error(f"Статус код: {response.status_code}, текст ответа: {response.text}")
     except Exception as e:
         logger.error(f"Ошибка при получении токена: {e}")
-        return None
+    return None
+
 
 def get_filtered_launches(access_token, endpoint_url, is_linux=False):
     """Получаем и фильтруем запуски для указанного endpoint"""
@@ -69,14 +78,9 @@ def get_filtered_launches(access_token, endpoint_url, is_linux=False):
         response.raise_for_status()
         launches = response.json().get("content", [])
 
-        last_30 = None
-        last_29 = None
-        linux_version = None
-
-        for launch in launches:
-            attributes = launch.get("attributes", [])
-
-            if is_linux:
+        if is_linux:
+            for launch in launches:
+                attributes = launch.get("attributes", [])
                 version = None
                 has_os = False
                 has_db = False
@@ -90,10 +94,14 @@ def get_filtered_launches(access_token, endpoint_url, is_linux=False):
                         has_db = True
 
                 if version and version.startswith("4.00") and has_os and has_db:
-                    if launch.get("status") in ["FAILED", "PASSED"]:
-                        linux_version = launch
-                        break
-            else:
+                    return [launch]
+            return []
+        else:
+            last_30 = None
+            last_29 = None
+
+            for launch in launches:
+                attributes = launch.get("attributes", [])
                 has_full_version = False
                 has_relaunch = False
                 has_db_type = False
@@ -114,21 +122,63 @@ def get_filtered_launches(access_token, endpoint_url, is_linux=False):
 
                 if has_full_version and has_relaunch and has_db_type:
                     if full_version.startswith("3.30") and (last_30 is None or
-                        datetime.fromisoformat(launch["startTime"].replace('Z', '+00:00')) >
-                        datetime.fromisoformat(last_30["startTime"].replace('Z', '+00:00'))):
+                                                            datetime.fromisoformat(
+                                                                launch["startTime"].replace('Z', '+00:00')) >
+                                                            datetime.fromisoformat(
+                                                                last_30["startTime"].replace('Z', '+00:00'))):
                         last_30 = launch
                     elif full_version.startswith("3.29") and (last_29 is None or
-                        datetime.fromisoformat(launch["startTime"].replace('Z', '+00:00')) >
-                        datetime.fromisoformat(last_29["startTime"].replace('Z', '+00:00'))):
+                                                              datetime.fromisoformat(
+                                                                  launch["startTime"].replace('Z', '+00:00')) >
+                                                              datetime.fromisoformat(
+                                                                  last_29["startTime"].replace('Z', '+00:00'))):
                         last_29 = launch
 
-        if is_linux:
-            return [linux_version] if linux_version else []
-        return [launch for launch in [last_30, last_29] if launch]
+            return [launch for launch in [last_30, last_29] if launch]
 
     except Exception as e:
         logger.error(f"Ошибка при получении запусков: {e}")
         return []
+
+
+def get_defect_links(access_token: str, launch_id: str, project: str = "superadmin_personal"):
+    """Получаем список уникальных ссылок на дефекты для указанного launch_id"""
+    url = f"{REPORTPORTAL_URL}/api/v1/{project}/item/v2"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json"
+    }
+    params = {
+        "filter.under.path": "155778",
+        "page.page": 1,
+        "page.size": 50,
+        "page.sort": "startTime,ASC",
+        "filter.eq.hasStats": "true",
+        "filter.eq.hasChildren": "false",
+        "filter.in.issueType": "pb001",
+        "providerType": "launch",
+        "launchId": launch_id
+    }
+
+    try:
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        defects = response.json().get("content", [])
+
+        links = set()
+        for defect in defects:
+            issue = defect.get("issue", {})
+            # Добавляем проверку типа проблемы и наличия комментария
+            if issue.get("issueType") == "pb001":
+                comment = issue.get("comment", "")
+                if comment and comment.startswith("https://a2nta.ru/Issues/"):
+                    links.add(comment)
+        return sorted(links)
+
+    except Exception as e:
+        logger.error(f"Ошибка при получении дефектов: {e}", exc_info=True)
+        return []
+
 
 def format_statistics(launch, launch_type):
     """Форматируем статистику для вывода"""
@@ -137,12 +187,14 @@ def format_statistics(launch, launch_type):
 
     stats = launch.get("statistics", {}).get("executions", {})
 
-    version_key = "Version" if launch_type == "Linux прогон" else "FullVersion"
+    version_key = "Version" if "Linux" in launch_type else "FullVersion"
     version = next(
         (attr.get("value") for attr in launch.get("attributes", [])
          if attr.get("key") == version_key),
         "Не указана"
     )
+
+    project = "linux_tests" if "Linux" in launch_type else "superadmin_personal"
 
     return (
         f"{launch_type}\n"
@@ -155,73 +207,135 @@ def format_statistics(launch, launch_type):
         f"Пропущено: {stats.get('skipped', 0)}\n"
         f"Статус: {launch.get('status')}\n"
         f"Время начала: {launch.get('startTime')}\n"
-        f"Ссылка: {REPORTPORTAL_URL}/ui/#{launch_type.split()[0].lower()}/launches/all/{launch.get('id')}\n"
+        f"Ссылка: {REPORTPORTAL_URL}/ui/#{project}/launches/all/{launch.get('id')}\n"
     )
+
 
 async def send_report_to_chat(context: CallbackContext, chat_id: int):
     """Функция для отправки отчета в указанный чат"""
     try:
         access_token = get_access_token()
+        #logger.info(f"Полученный токен: {access_token}")
+
         if not access_token:
-            await context.bot.send_message(chat_id=chat_id, text="Не удалось получить access_token")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ Не удалось получить access_token"
+            )
             return
 
-        all_versions = []
-        collected_launches = []
-
-        # Основные прогоны
+        # Собираем информацию о запусках
         main_launches = get_filtered_launches(access_token, SUPERADMIN_LAUNCHES_URL)
-        for launch in main_launches:
-            collected_launches.append(("superadmin_personal", launch))
-            all_versions.extend([
-                attr.get("value") for attr in launch.get("attributes", [])
-                if attr.get("key") == "FullVersion"
-            ])
-
-        # Linux прогоны
         linux_launches = get_filtered_launches(access_token, LINUX_LAUNCHES_URL, is_linux=True)
-        for launch in linux_launches:
-            collected_launches.append(("linux_tests", launch))
-            all_versions.extend([
-                attr.get("value") for attr in launch.get("attributes", [])
-                if attr.get("key") == "Version"
-            ])
 
-        # Отправка сообщений
-        for launch_type, launch in collected_launches:
-            message = format_statistics(launch, launch_type)
-            await context.bot.send_message(chat_id=chat_id, text=message)
+        # Логирование информации о найденных запусках
+        logger.info(f"Основные прогоны: {[l.get('id') for l in main_launches]}")
+        logger.info(f"Linux прогоны: {[l.get('id') for l in linux_launches]}")
 
-        # Итоговое сообщение
-        if all_versions:
-            versions_str = ", ".join(sorted(set(all_versions), reverse=True))
+        # Получаем ID для разных версий
+        version_ids = {
+            "3.30": None,
+            "3.29": None
+        }
+
+        for launch in main_launches:
+            version = next(
+                (attr.get("value") for attr in launch.get("attributes", [])
+                 if attr.get("key") == "FullVersion"),
+                None
+            )
+            if version and version.startswith("3.30"):
+                version_ids["3.30"] = launch.get("id")
+            elif version and version.startswith("3.29"):
+                version_ids["3.29"] = launch.get("id")
+
+        logger.info(f"Найденные ID версий: {version_ids}")
+
+        # Формируем основной отчет
+        report_parts = ["📊 <b>Ежедневный отчет о тестировании</b> 📊"]
+
+        # Добавляем информацию о прогонах
+        for launch_type, launches in [("Основные", main_launches), ("Linux", linux_launches)]:
+            if launches:
+                for launch in launches:
+                    report_parts.append(format_statistics(launch, f"{launch_type} прогон"))
+            else:
+                report_parts.append(f"⚠️ {launch_type} прогоны не найдены")
+
+        # Отправляем основной отчет частями
+        current_message = []
+        for part in report_parts:
+            if len("\n\n".join(current_message + [part])) > 4096:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="\n\n".join(current_message),
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+                current_message = [part]
+            else:
+                current_message.append(part)
+
+        if current_message:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"Отчет по последним запускам версий: {versions_str}"
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Не найдено актуальных запусков"
+                text="\n\n".join(current_message),
+                parse_mode="HTML",
+                disable_web_page_preview=True
             )
 
+        # Отправляем дефекты
+        for version, launch_id in version_ids.items():
+            if launch_id:
+                defects = get_defect_links(access_token, launch_id)
+                logger.info(f"Дефекты для {version}: {defects}")
+                if defects:
+                    message = [
+                        f"🔴 <b>Список дефектов {version}:</b>",
+                        *defects
+                    ]
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="\n".join(message),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🟢 Для версии {version} дефектов не найдено",
+                        parse_mode="HTML"
+                    )
+
+        logger.info("Отчет успешно отправлен в канал")
+    except telegram.error.BadRequest as e:
+        logger.error(f"Ошибка Telegram API: {e.message}")
+        if "Chat not found" in str(e):
+            logger.error("Проверьте правильность TELEGRAM_CHAT_ID")
     except Exception as e:
-        logger.error(f"Ошибка при отправке отчета: {e}")
-        await context.bot.send_message(chat_id=chat_id, text=f"Произошла ошибка: {e}")
+        logger.error(f"Критическая ошибка: {e}", exc_info=True)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🚨 Произошла ошибка: {str(e)}"
+        )
+
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /report"""
     await send_report_to_chat(context, update.effective_chat.id)
 
+
 async def daily_report(context: CallbackContext):
     """Ежедневная отправка отчета"""
     await send_report_to_chat(context, TELEGRAM_CHAT_ID)
+
 
 async def post_init(application):
     """Действия после инициализации бота"""
     job_queue = application.job_queue
     job_queue.run_daily(daily_report, time=DAILY_REPORT_TIME)
     await daily_report(application)
+
 
 def main():
     """Запуск бота"""
@@ -232,6 +346,7 @@ def main():
 
     application.add_handler(CommandHandler("report", report_command))
     application.run_polling()
+
 
 if __name__ == '__main__':
     main()
