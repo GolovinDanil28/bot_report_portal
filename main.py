@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 def get_access_token():
     """Получаем access_token от ReportPortal"""
     try:
-        response = requests.post(AUTH_URL, headers=AUTH_HEADERS, data=AUTH_DATA)
+        response = requests.post(AUTH_URL, headers=AUTH_HEADERS, data=AUTH_DATA, verify=False)
         response.raise_for_status()
 
         logger.info("Токен успешно получен.")
@@ -74,7 +74,7 @@ def get_filtered_launches(access_token, endpoint_url, is_linux=False):
     }
 
     try:
-        response = requests.get(endpoint_url, headers=headers, params=params)
+        response = requests.get(endpoint_url, headers=headers, params=params, verify=False)
         response.raise_for_status()
         launches = response.json().get("content", [])
 
@@ -149,9 +149,8 @@ def get_defect_links(access_token: str, launch_id: str, project: str = "superadm
         "Accept": "application/json"
     }
     params = {
-        "filter.under.path": "155778",
         "page.page": 1,
-        "page.size": 50,
+        "page.size": 100,  # Увеличиваем размер страницы для получения всех дефектов
         "page.sort": "startTime,ASC",
         "filter.eq.hasStats": "true",
         "filter.eq.hasChildren": "false",
@@ -161,18 +160,34 @@ def get_defect_links(access_token: str, launch_id: str, project: str = "superadm
     }
 
     try:
-        response = requests.get(url, headers=headers, params=params)
+        response = requests.get(url, headers=headers, params=params, verify=False)
         response.raise_for_status()
-        defects = response.json().get("content", [])
 
+        defects = response.json().get("content", [])
         links = set()
+
         for defect in defects:
             issue = defect.get("issue", {})
-            # Добавляем проверку типа проблемы и наличия комментария
             if issue.get("issueType") == "pb001":
                 comment = issue.get("comment", "")
                 if comment and comment.startswith("https://a2nta.ru/Issues/"):
                     links.add(comment)
+
+        # Обработка пагинации, если результатов больше 100
+        total_pages = response.json().get("page", {}).get("totalPages", 1)
+        if total_pages > 1:
+            for page in range(2, total_pages + 1):
+                params["page.page"] = page
+                response = requests.get(url, headers=headers, params=params, verify=False)
+                response.raise_for_status()
+                for defect in response.json().get("content", []):
+                    issue = defect.get("issue", {})
+                    if issue.get("issueType") == "pb001":
+                        comment = issue.get("comment", "")
+                        if comment and comment.startswith("https://a2nta.ru/Issues/"):
+                            links.add(comment)
+
+        logger.info(f"Найдено {len(links)} дефектов для launch_id {launch_id}")
         return sorted(links)
 
     except Exception as e:
@@ -215,7 +230,7 @@ async def send_report_to_chat(context: CallbackContext, chat_id: int):
     """Функция для отправки отчета в указанный чат"""
     try:
         access_token = get_access_token()
-        #logger.info(f"Полученный токен: {access_token}")
+        logger.info(f"Полученный токен: {access_token}")
 
         if not access_token:
             await context.bot.send_message(
