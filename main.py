@@ -17,6 +17,19 @@ import asyncio
 # Конфигурация
 load_dotenv()
 
+# Проверка обязательных переменных окружения
+required_env_vars = [
+    "REPORT_PORTAL_USERNAME",
+    "REPORT_PORTAL_PASSWORD",
+    "TELEGRAM_TOKEN",
+    "TELEGRAM_CHAT_ID"
+]
+
+for var in required_env_vars:
+    if not os.getenv(var):
+        logging.error(f"Отсутствует обязательная переменная окружения: {var}")
+        exit(1)
+
 REPORTPORTAL_URL = "https://reportportal.a2nta.ru"
 AUTH_URL = f"{REPORTPORTAL_URL}/uat/sso/oauth/token"
 SUPERADMIN_LAUNCHES_URL = f"{REPORTPORTAL_URL}/api/v1/superadmin_personal/launch"
@@ -28,36 +41,36 @@ AUTH_HEADERS = {
 }
 AUTH_DATA = {
     "grant_type": "password",
-    "username": os.getenv("REPORTPORTAL_USERNAME"),
-    "password": os.getenv("REPORTPORTAL_PASSWORD")
+    "username": os.getenv("REPORT_PORTAL_USERNAME"),
+    "password": os.getenv("REPORT_PORTAL_PASSWORD")
 }
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))  # Конвертируем в число
 
-DAILY_REPORT_TIME = time(hour=9, minute=0, tzinfo=pytz.timezone('Europe/Moscow'))
-
+# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# Отключение SSL-предупреждений
+requests.packages.urllib3.disable_warnings()
 
 def get_access_token():
     """Получаем access_token от ReportPortal"""
     try:
-        response = requests.post(AUTH_URL, headers=AUTH_HEADERS, data=AUTH_DATA, verify=False)
+        response = requests.post(
+            AUTH_URL,
+            headers=AUTH_HEADERS,
+            data=AUTH_DATA,
+            verify=False
+        )
         response.raise_for_status()
-
-        logger.info("Токен успешно получен.")
         return response.json().get("access_token")
-    except requests.exceptions.HTTPError as http_err:
-        logger.error(f"HTTP ошибка при получении токена: {http_err}")
-        if response:
-            logger.error(f"Статус код: {response.status_code}, текст ответа: {response.text}")
     except Exception as e:
-        logger.error(f"Ошибка при получении токена: {e}")
-    return None
+        logger.error(f"Ошибка при получении токена: {str(e)}")
+        return None
 
 
 def get_filtered_launches(access_token, endpoint_url, is_linux=False):
@@ -345,22 +358,29 @@ async def daily_report(context: CallbackContext):
     await send_report_to_chat(context, TELEGRAM_CHAT_ID)
 
 
-async def post_init(application):
+#async def post_init(application):
     """Действия после инициализации бота"""
-    job_queue = application.job_queue
-    job_queue.run_daily(daily_report, time=DAILY_REPORT_TIME)
-    await daily_report(application)
+    #job_queue = application.job_queue
+    #job_queue.run_daily(daily_report, time=DAILY_REPORT_TIME)
+    #await daily_report(application)
 
 
 def main():
-    """Запуск бота"""
-    application = ApplicationBuilder() \
-        .token(TELEGRAM_TOKEN) \
-        .post_init(post_init) \
-        .build()
+    """Запуск бота для одноразовой отправки отчета"""
+    try:
+        application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    application.add_handler(CommandHandler("report", report_command))
-    application.run_polling()
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        loop.run_until_complete(send_report_to_chat(application, TELEGRAM_CHAT_ID))
+
+        application.stop()
+        application.shutdown()
+
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении: {e}")
+        exit(1)
 
 
 if __name__ == '__main__':
