@@ -92,24 +92,28 @@ def get_filtered_launches(access_token, endpoint_url, is_linux=False):
         launches = response.json().get("content", [])
 
         if is_linux:
+            # Собираем все подходящие Linux прогоны
+            linux_launches = []
             for launch in launches:
                 attributes = launch.get("attributes", [])
-                version = None
                 has_os = False
                 has_db = False
 
                 for attr in attributes:
-                    if attr.get("key") == "Version":
-                        version = attr.get("value")
-                    elif attr.get("key") == "OS" and attr.get("value") == "Linux":
+                    if attr.get("key") == "OS" and attr.get("value") == "Linux":
                         has_os = True
                     elif attr.get("key") == "Database" and attr.get("value") == "PostgreSQL":
                         has_db = True
 
-                if version and version.startswith("4.00") and has_os and has_db:
-                    return [launch]
-            return []
+                # Отбираем только Linux/PostgreSQL прогоны
+                if has_os and has_db:
+                    linux_launches.append(launch)
+
+            # Возвращаем два последних прогона
+            return linux_launches[:2]
+
         else:
+            # Оригинальная логика для superadmin_personal
             last_30 = None
             last_29 = None
 
@@ -215,12 +219,16 @@ def format_statistics(launch, launch_type):
 
     stats = launch.get("statistics", {}).get("executions", {})
 
+    # Извлекаем версию и ветку
     version_key = "Version" if "Linux" in launch_type else "FullVersion"
-    version = next(
-        (attr.get("value") for attr in launch.get("attributes", [])
-         if attr.get("key") == version_key),
-        "Не указана"
-    )
+    version = "Не указана"
+    branch = "Не указана"
+
+    for attr in launch.get("attributes", []):
+        if attr.get("key") == version_key:
+            version = attr.get("value")
+        elif attr.get("key") == "Branch":
+            branch = attr.get("value")
 
     project = "linux_tests" if "Linux" in launch_type else "superadmin_personal"
 
@@ -228,6 +236,7 @@ def format_statistics(launch, launch_type):
         f"{launch_type}\n"
         f"ID запуска: {launch.get('id')}\n"
         f"Версия: {version}\n"
+        f"Ветка: {branch}\n"  # Добавлена ветка
         f"Название: {launch.get('name')}\n"
         f"Всего тестов: {stats.get('total', 0)}\n"
         f"Пройдено: {stats.get('passed', 0)}\n"
@@ -312,7 +321,7 @@ async def send_report_to_chat(context: CallbackContext, chat_id: int):
                 disable_web_page_preview=True
             )
 
-        # Отправляем дефекты
+        # Отправляем дефекты для основных версий
         for version, launch_id in version_ids.items():
             if launch_id:
                 defects = get_defect_links(access_token, launch_id)
@@ -335,6 +344,39 @@ async def send_report_to_chat(context: CallbackContext, chat_id: int):
                         parse_mode="HTML"
                     )
 
+        # ДОБАВЛЕНО: Отправляем дефекты для Linux прогонов
+        if linux_launches:
+            for launch in linux_launches:
+                # Извлекаем информацию о ветке и версии для заголовка
+                branch = "Не указана"
+                version = "Не указана"
+                for attr in launch.get("attributes", []):
+                    if attr.get("key") == "Branch":
+                        branch = attr.get("value")
+                    elif attr.get("key") == "Version":
+                        version = attr.get("value")
+
+                defects = get_defect_links(access_token, launch.get("id"), project="linux_tests")
+                logger.info(f"Дефекты для Linux прогона (ID: {launch.get('id')}): {defects}")
+
+                if defects:
+                    message = [
+                        f"🔴 <b>Список дефектов Linux (Ветка: {branch}, Версия: {version}):</b>",
+                        *defects
+                    ]
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text="\n".join(message),
+                        parse_mode="HTML",
+                        disable_web_page_preview=True
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🟢 Для Linux прогона (Ветка: {branch}, Версия: {version}) дефектов не найдено",
+                        parse_mode="HTML"
+                    )
+
         logger.info("Отчет успешно отправлен в канал")
     except telegram.error.BadRequest as e:
         logger.error(f"Ошибка Telegram API: {e.message}")
@@ -346,7 +388,6 @@ async def send_report_to_chat(context: CallbackContext, chat_id: int):
             chat_id=chat_id,
             text=f"🚨 Произошла ошибка: {str(e)}"
         )
-
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /report"""
