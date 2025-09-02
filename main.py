@@ -13,6 +13,7 @@ import os
 from dotenv import load_dotenv
 import pytz
 import asyncio
+from datetime import datetime, timedelta
 
 # Конфигурация
 load_dotenv()
@@ -79,11 +80,20 @@ def get_filtered_launches(access_token, endpoint_url, is_linux=False):
         "Authorization": f"Bearer {access_token}",
         "Accept": "application/json, text/plain, */*"
     }
+
+    if is_linux:
+        # Для Linux: 3 дня назад
+        time_filter = (datetime.now() - timedelta(hours=24)).isoformat() + 'Z'
+    else:
+        # Для superadmin_personal: 12 часов назад
+        time_filter = (datetime.now() - timedelta(hours=24)).isoformat() + 'Z'
+
     params = {
         "ids": "",
         "page.page": 1,
-        "page.size": 50,
-        "page.sort": "startTime,number,DESC"
+        "page.size": 100,
+        "page.sort": "startTime,number,DESC",
+        "filter.gt.startTime": time_filter
     }
 
     try:
@@ -92,25 +102,37 @@ def get_filtered_launches(access_token, endpoint_url, is_linux=False):
         launches = response.json().get("content", [])
 
         if is_linux:
-            # Собираем все подходящие Linux прогоны
-            linux_launches = []
+            # Собираем уникальные комбинации ветка+коммит
+            unique_combinations = {}
             for launch in launches:
                 attributes = launch.get("attributes", [])
                 has_os = False
                 has_db = False
+                branch = None
+                commit_hash = None
 
                 for attr in attributes:
                     if attr.get("key") == "OS" and attr.get("value") == "Linux":
                         has_os = True
                     elif attr.get("key") == "Database" and attr.get("value") == "PostgreSQL":
                         has_db = True
+                    elif attr.get("key") == "Branch":
+                        branch = attr.get("value")
+                    elif attr.get("key") == "Commit hash":
+                        commit_hash = attr.get("value")
 
-                # Отбираем только Linux/PostgreSQL прогоны
-                if has_os and has_db:
-                    linux_launches.append(launch)
+                # Отбираем только Linux/PostgreSQL прогоны с указанием ветки и коммита
+                if has_os and has_db and branch and commit_hash:
+                    combination_key = f"{branch}_{commit_hash}"
 
-            # Возвращаем два последних прогона
-            return linux_launches[:2]
+                    # Берем самый свежий запуск для каждой уникальной комбинации
+                    existing_launch = unique_combinations.get(combination_key)
+                    if not existing_launch or datetime.fromisoformat(
+                            launch["startTime"].replace('Z', '+00:00')) > datetime.fromisoformat(
+                        existing_launch["startTime"].replace('Z', '+00:00')):
+                        unique_combinations[combination_key] = launch
+
+            return list(unique_combinations.values())
 
         else:
             # Оригинальная логика для superadmin_personal
@@ -157,7 +179,6 @@ def get_filtered_launches(access_token, endpoint_url, is_linux=False):
         logger.error(f"Ошибка при получении запусков: {e}")
         return []
 
-
 def get_defect_links(access_token: str, launch_id: str, project: str = "superadmin_personal"):
     """Получаем список уникальных ссылок на дефекты для указанного launch_id"""
     url = f"{REPORTPORTAL_URL}/api/v1/{project}/item/v2"
@@ -167,7 +188,7 @@ def get_defect_links(access_token: str, launch_id: str, project: str = "superadm
     }
     params = {
         "page.page": 1,
-        "page.size": 100,  # Увеличиваем размер страницы для получения всех дефектов
+        "page.size": 100,
         "page.sort": "startTime,ASC",
         "filter.eq.hasStats": "true",
         "filter.eq.hasChildren": "false",
@@ -177,7 +198,7 @@ def get_defect_links(access_token: str, launch_id: str, project: str = "superadm
     }
 
     try:
-        response = requests.get(url, headers=headers, params=params, verify=False)
+        response = requests.get(url, headers=headers, params=params, verify=False, timeout=30)
         response.raise_for_status()
 
         defects = response.json().get("content", [])
@@ -190,12 +211,12 @@ def get_defect_links(access_token: str, launch_id: str, project: str = "superadm
                 if comment and comment.startswith("https://a2nta.ru/Issues/"):
                     links.add(comment)
 
-        # Обработка пагинации, если результатов больше 100
+        # Обработка пагинации
         total_pages = response.json().get("page", {}).get("totalPages", 1)
         if total_pages > 1:
             for page in range(2, total_pages + 1):
                 params["page.page"] = page
-                response = requests.get(url, headers=headers, params=params, verify=False)
+                response = requests.get(url, headers=headers, params=params, verify=False, timeout=30)
                 response.raise_for_status()
                 for defect in response.json().get("content", []):
                     issue = defect.get("issue", {})
@@ -207,6 +228,9 @@ def get_defect_links(access_token: str, launch_id: str, project: str = "superadm
         logger.info(f"Найдено {len(links)} дефектов для launch_id {launch_id}")
         return sorted(links)
 
+    except requests.exceptions.Timeout:
+        logger.error(f"Таймаут при получении дефектов для launch_id {launch_id}")
+        return []
     except Exception as e:
         logger.error(f"Ошибка при получении дефектов: {e}", exc_info=True)
         return []
@@ -218,17 +242,19 @@ def format_statistics(launch, launch_type):
         return f"{launch_type}: нет данных о запуске"
 
     stats = launch.get("statistics", {}).get("executions", {})
-
-    # Извлекаем версию и ветку
-    version_key = "Version" if "Linux" in launch_type else "FullVersion"
     version = "Не указана"
     branch = "Не указана"
+    commit_hash = "Не указан"
 
     for attr in launch.get("attributes", []):
-        if attr.get("key") == version_key:
+        if attr.get("key") == "Version":
+            version = attr.get("value")
+        elif attr.get("key") == "FullVersion":
             version = attr.get("value")
         elif attr.get("key") == "Branch":
             branch = attr.get("value")
+        elif attr.get("key") == "Commit hash":
+            commit_hash = attr.get("value")
 
     project = "linux_tests" if "Linux" in launch_type else "superadmin_personal"
 
@@ -236,7 +262,8 @@ def format_statistics(launch, launch_type):
         f"{launch_type}\n"
         f"ID запуска: {launch.get('id')}\n"
         f"Версия: {version}\n"
-        f"Ветка: {branch}\n"  # Добавлена ветка
+        f"Ветка: {branch}\n"
+        f"Коммит: {commit_hash}\n"
         f"Название: {launch.get('name')}\n"
         f"Всего тестов: {stats.get('total', 0)}\n"
         f"Пройдено: {stats.get('passed', 0)}\n"
@@ -261,9 +288,26 @@ async def send_report_to_chat(context: CallbackContext, chat_id: int):
             )
             return
 
-        # Собираем информацию о запусках
-        main_launches = get_filtered_launches(access_token, SUPERADMIN_LAUNCHES_URL)
-        linux_launches = get_filtered_launches(access_token, LINUX_LAUNCHES_URL, is_linux=True)
+        # Собираем информацию о запусках с таймаутом
+        try:
+            main_launches = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, get_filtered_launches, access_token, SUPERADMIN_LAUNCHES_URL
+                ),
+                timeout=60
+            )
+            linux_launches = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, get_filtered_launches, access_token, LINUX_LAUNCHES_URL, True
+                ),
+                timeout=60
+            )
+        except asyncio.TimeoutError:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="❌ Таймаут при получении данных о запусках"
+            )
+            return
 
         # Логирование информации о найденных запусках
         logger.info(f"Основные прогоны: {[l.get('id') for l in main_launches]}")
@@ -344,7 +388,7 @@ async def send_report_to_chat(context: CallbackContext, chat_id: int):
                         parse_mode="HTML"
                     )
 
-        # ДОБАВЛЕНО: Отправляем дефекты для Linux прогонов
+        # Отправляем дефекты для Linux прогонов
         if linux_launches:
             for launch in linux_launches:
                 # Извлекаем информацию о ветке и версии для заголовка
@@ -397,13 +441,6 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def daily_report(context: CallbackContext):
     """Ежедневная отправка отчета"""
     await send_report_to_chat(context, TELEGRAM_CHAT_ID)
-
-
-#async def post_init(application):
-    """Действия после инициализации бота"""
-    #job_queue = application.job_queue
-    #job_queue.run_daily(daily_report, time=DAILY_REPORT_TIME)
-    #await daily_report(application)
 
 
 def main():
