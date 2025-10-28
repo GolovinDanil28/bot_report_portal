@@ -82,24 +82,34 @@ def get_filtered_launches(access_token, endpoint_url, is_linux=False):
     }
 
     if is_linux:
-        # Для Linux: 3 дня назад
-        time_filter = (datetime.now() - timedelta(hours=24)).isoformat() + 'Z'
+        # Для Linux: 36 часов назад
+        time_filter = (datetime.now() - timedelta(hours=36)).isoformat() + 'Z'
+        # Параметры для Linux запусков
+        params = {
+            "ids": "",
+            "page.page": 1,
+            "page.size": 50,
+            "page.sort": "startTime,number,DESC",
+            "filter.gt.startTime": time_filter
+        }
     else:
-        # Для superadmin_personal: 12 часов назад
+        # Для superadmin_personal: 24 часа назад
         time_filter = (datetime.now() - timedelta(hours=24)).isoformat() + 'Z'
-
-    params = {
-        "ids": "",
-        "page.page": 1,
-        "page.size": 100,
-        "page.sort": "startTime,number,DESC",
-        "filter.gt.startTime": time_filter
-    }
+        params = {
+            "ids": "",
+            "page.page": 1,
+            "page.size": 100,
+            "page.sort": "startTime,number,DESC",
+            "filter.gt.startTime": time_filter
+        }
 
     try:
         response = requests.get(endpoint_url, headers=headers, params=params, verify=False)
         response.raise_for_status()
         launches = response.json().get("content", [])
+
+        # Фильтруем запуски, исключая те, которые в статусе IN_PROGRESS
+        launches = [launch for launch in launches if launch.get("status") != "IN_PROGRESS"]
 
         if is_linux:
             # Собираем уникальные комбинации ветка+коммит
@@ -208,7 +218,10 @@ def get_defect_links(access_token: str, launch_id: str, project: str = "superadm
             issue = defect.get("issue", {})
             if issue.get("issueType") == "pb001":
                 comment = issue.get("comment", "")
-                if comment and comment.startswith("https://a2nta.ru/Issues/"):
+                if comment and (
+                        comment.startswith("https://a2nta.ru/Issues/") or
+                        comment.startswith("https://jira.a2nta.ru")
+                ):
                     links.add(comment)
 
         # Обработка пагинации
@@ -222,7 +235,10 @@ def get_defect_links(access_token: str, launch_id: str, project: str = "superadm
                     issue = defect.get("issue", {})
                     if issue.get("issueType") == "pb001":
                         comment = issue.get("comment", "")
-                        if comment and comment.startswith("https://a2nta.ru/Issues/"):
+                        if comment and (
+                                comment.startswith("https://a2nta.ru/Issues/") or
+                                comment.startswith("https://jira.a2nta.ru")
+                        ):
                             links.add(comment)
 
         logger.info(f"Найдено {len(links)} дефектов для launch_id {launch_id}")
