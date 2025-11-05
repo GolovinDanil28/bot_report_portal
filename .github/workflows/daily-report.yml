@@ -2,7 +2,7 @@ name: Daily Report Bot
 
 on:
   schedule:
-    - cron: '0 5 * * *'  # 08:00 МСК (UTC+3)
+    - cron: '0 7 * * *'  # 10:00 МСК (UTC+3)
   workflow_dispatch:
 
 jobs:
