@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 import pytz
 import asyncio
 from datetime import datetime, timedelta
+from functools import wraps
+import time as time_module
 
 # Конфигурация
 load_dotenv()
@@ -58,6 +60,63 @@ logger = logging.getLogger(__name__)
 # Отключение SSL-предупреждений
 requests.packages.urllib3.disable_warnings()
 
+
+# Декоратор для повторных попыток
+def retry_with_backoff(max_retries=3, backoff_factor=2, exceptions=(Exception,)):
+    """Декоратор для повторных попыток с экспоненциальной задержкой"""
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            retries = 0
+            while retries < max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    retries += 1
+                    if retries == max_retries:
+                        logger.error(f"Функция {func.__name__} упала после {max_retries} попыток: {str(e)}")
+                        raise
+
+                    wait_time = backoff_factor ** retries
+                    logger.warning(f"Попытка {retries}/{max_retries} не удалась для {func.__name__}. "
+                                   f"Ждем {wait_time} секунд перед повторной попыткой. Ошибка: {str(e)}")
+                    time_module.sleep(wait_time)
+            return None
+
+        return wrapper
+
+    return decorator
+
+
+def retry_with_backoff_async(max_retries=3, backoff_factor=2, exceptions=(Exception,)):
+    """Асинхронный декоратор для повторных попыток с экспоненциальной задержкой"""
+
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            retries = 0
+            while retries < max_retries:
+                try:
+                    return await func(*args, **kwargs)
+                except exceptions as e:
+                    retries += 1
+                    if retries == max_retries:
+                        logger.error(f"Функция {func.__name__} упала после {max_retries} попыток: {str(e)}")
+                        raise
+
+                    wait_time = backoff_factor ** retries
+                    logger.warning(f"Попытка {retries}/{max_retries} не удалась для {func.__name__}. "
+                                   f"Ждем {wait_time} секунд перед повторной попыткой. Ошибка: {str(e)}")
+                    await asyncio.sleep(wait_time)
+            return None
+
+        return wrapper
+
+    return decorator
+
+
+@retry_with_backoff(max_retries=3, exceptions=(requests.exceptions.Timeout, requests.exceptions.ConnectionError))
 def get_access_token():
     """Получаем access_token от ReportPortal"""
     try:
@@ -65,15 +124,17 @@ def get_access_token():
             AUTH_URL,
             headers=AUTH_HEADERS,
             data=AUTH_DATA,
-            verify=False
+            verify=False,
+            timeout=30
         )
         response.raise_for_status()
         return response.json().get("access_token")
     except Exception as e:
         logger.error(f"Ошибка при получении токена: {str(e)}")
-        return None
+        raise
 
 
+@retry_with_backoff(max_retries=3, exceptions=(requests.exceptions.Timeout, requests.exceptions.ConnectionError))
 def get_filtered_launches(access_token, endpoint_url, is_linux=False):
     """Получаем и фильтруем запуски для указанного endpoint"""
     headers = {
@@ -104,7 +165,7 @@ def get_filtered_launches(access_token, endpoint_url, is_linux=False):
         }
 
     try:
-        response = requests.get(endpoint_url, headers=headers, params=params, verify=False)
+        response = requests.get(endpoint_url, headers=headers, params=params, verify=False, timeout=60)
         response.raise_for_status()
         launches = response.json().get("content", [])
 
@@ -155,6 +216,8 @@ def get_filtered_launches(access_token, endpoint_url, is_linux=False):
                 has_relaunch = False
                 has_db_type = False
                 full_version = None
+                branch = None
+                commit_hash = None
 
                 for attr in attributes:
                     if attr.get("key") == "FullVersion":
@@ -168,8 +231,21 @@ def get_filtered_launches(access_token, endpoint_url, is_linux=False):
                         has_relaunch = True
                     elif attr.get("key") == "Db type" and attr.get("value") == "postgres":
                         has_db_type = True
+                    elif attr.get("key") == "Branch name":  # ИСПРАВЛЕНО: Branch -> Branch name
+                        branch = attr.get("value")
+                    elif attr.get("key") == "Version":
+                        # Version содержит "3.29" или "3.30"
+                        pass
+                    elif attr.get("key") == "Commit hash":
+                        commit_hash = attr.get("value")
 
                 if has_full_version and has_relaunch and has_db_type:
+                    # Сохраняем ветку в атрибуте запуска для последующего использования
+                    if branch:
+                        launch['_branch'] = branch
+                    if commit_hash:
+                        launch['_commit_hash'] = commit_hash
+
                     if full_version.startswith("3.30") and (last_30 is None or
                                                             datetime.fromisoformat(
                                                                 launch["startTime"].replace('Z', '+00:00')) >
@@ -187,8 +263,10 @@ def get_filtered_launches(access_token, endpoint_url, is_linux=False):
 
     except Exception as e:
         logger.error(f"Ошибка при получении запусков: {e}")
-        return []
+        raise
 
+
+@retry_with_backoff(max_retries=3, exceptions=(requests.exceptions.Timeout, requests.exceptions.ConnectionError))
 def get_defect_links(access_token: str, launch_id: str, project: str = "superadmin_personal"):
     """Получаем список уникальных ссылок на дефекты для указанного launch_id"""
     url = f"{REPORTPORTAL_URL}/api/v1/{project}/item/v2"
@@ -246,10 +324,10 @@ def get_defect_links(access_token: str, launch_id: str, project: str = "superadm
 
     except requests.exceptions.Timeout:
         logger.error(f"Таймаут при получении дефектов для launch_id {launch_id}")
-        return []
+        raise
     except Exception as e:
         logger.error(f"Ошибка при получении дефектов: {e}", exc_info=True)
-        return []
+        raise
 
 
 def format_statistics(launch, launch_type):
@@ -262,15 +340,31 @@ def format_statistics(launch, launch_type):
     branch = "Не указана"
     commit_hash = "Не указан"
 
+    # Сначала ищем в атрибутах, игнорируя временные поля _branch
     for attr in launch.get("attributes", []):
         if attr.get("key") == "Version":
-            version = attr.get("value")
+            # Для Linux тестов Version содержит версию
+            if "Linux" in launch_type:
+                version = attr.get("value")
+            # Для основных тестов Version содержит "3.29" или "3.30" - это НЕ ветка!
+            # Для ветки используем Branch name
         elif attr.get("key") == "FullVersion":
             version = attr.get("value")
-        elif attr.get("key") == "Branch":
+        elif attr.get("key") == "Branch name":
             branch = attr.get("value")
+        elif attr.get("key") == "Branch":  # Для обратной совместимости
+            if branch == "Не указана":
+                branch = attr.get("value")
         elif attr.get("key") == "Commit hash":
             commit_hash = attr.get("value")
+
+    # Если ветка не найдена в атрибутах, проверяем временное поле _branch
+    if branch == "Не указана" and '_branch' in launch:
+        branch = launch['_branch']
+
+    # Если коммит не найден в атрибутах, проверяем временное поле _commit_hash
+    if commit_hash == "Не указан" and '_commit_hash' in launch:
+        commit_hash = launch['_commit_hash']
 
     project = "linux_tests" if "Linux" in launch_type else "superadmin_personal"
 
@@ -291,11 +385,13 @@ def format_statistics(launch, launch_type):
     )
 
 
+@retry_with_backoff_async(max_retries=3, exceptions=(asyncio.TimeoutError, telegram.error.TimedOut,
+                                                     requests.exceptions.Timeout, requests.exceptions.ConnectionError))
 async def send_report_to_chat(context: CallbackContext, chat_id: int):
     """Функция для отправки отчета в указанный чат"""
     try:
         access_token = get_access_token()
-        logger.info(f"Полученный токен: {access_token}")
+        logger.info(f"Токен получен успешно")
 
         if not access_token:
             await context.bot.send_message(
@@ -318,12 +414,9 @@ async def send_report_to_chat(context: CallbackContext, chat_id: int):
                 ),
                 timeout=60
             )
-        except asyncio.TimeoutError:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="❌ Таймаут при получении данных о запусках"
-            )
-            return
+        except asyncio.TimeoutError as e:
+            logger.error(f"Таймаут при получении данных о запусках: {e}")
+            raise
 
         # Логирование информации о найденных запусках
         logger.info(f"Основные прогоны: {[l.get('id') for l in main_launches]}")
@@ -384,23 +477,31 @@ async def send_report_to_chat(context: CallbackContext, chat_id: int):
         # Отправляем дефекты для основных версий
         for version, launch_id in version_ids.items():
             if launch_id:
-                defects = get_defect_links(access_token, launch_id)
-                logger.info(f"Дефекты для {version}: {defects}")
-                if defects:
-                    message = [
-                        f"🔴 <b>Список дефектов {version}:</b>",
-                        *defects
-                    ]
+                try:
+                    defects = get_defect_links(access_token, launch_id)
+                    logger.info(f"Дефекты для {version}: найдено {len(defects)}")
+                    if defects:
+                        message = [
+                            f"🔴 <b>Список дефектов {version}:</b>",
+                            *defects
+                        ]
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text="\n".join(message),
+                            parse_mode="HTML",
+                            disable_web_page_preview=True
+                        )
+                    else:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"🟢 Для версии {version} дефектов не найдено",
+                            parse_mode="HTML"
+                        )
+                except Exception as e:
+                    logger.error(f"Ошибка при получении дефектов для {version}: {e}")
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text="\n".join(message),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🟢 Для версии {version} дефектов не найдено",
+                        text=f"⚠️ Не удалось получить дефекты для версии {version}: {str(e)}",
                         parse_mode="HTML"
                     )
 
@@ -416,24 +517,32 @@ async def send_report_to_chat(context: CallbackContext, chat_id: int):
                     elif attr.get("key") == "Version":
                         version = attr.get("value")
 
-                defects = get_defect_links(access_token, launch.get("id"), project="linux_tests")
-                logger.info(f"Дефекты для Linux прогона (ID: {launch.get('id')}): {defects}")
+                try:
+                    defects = get_defect_links(access_token, launch.get("id"), project="linux_tests")
+                    logger.info(f"Дефекты для Linux прогона (ID: {launch.get('id')}): найдено {len(defects)}")
 
-                if defects:
-                    message = [
-                        f"🔴 <b>Список дефектов Linux (Ветка: {branch}, Версия: {version}):</b>",
-                        *defects
-                    ]
+                    if defects:
+                        message = [
+                            f"🔴 <b>Список дефектов Linux (Ветка: {branch}, Версия: {version}):</b>",
+                            *defects
+                        ]
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text="\n".join(message),
+                            parse_mode="HTML",
+                            disable_web_page_preview=True
+                        )
+                    else:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"🟢 Для Linux прогона (Ветка: {branch}, Версия: {version}) дефектов не найдено",
+                            parse_mode="HTML"
+                        )
+                except Exception as e:
+                    logger.error(f"Ошибка при получении дефектов для Linux прогона: {e}")
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text="\n".join(message),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🟢 Для Linux прогона (Ветка: {branch}, Версия: {version}) дефектов не найдено",
+                        text=f"⚠️ Не удалось получить дефекты для Linux прогона (Ветка: {branch}): {str(e)}",
                         parse_mode="HTML"
                     )
 
@@ -442,38 +551,81 @@ async def send_report_to_chat(context: CallbackContext, chat_id: int):
         logger.error(f"Ошибка Telegram API: {e.message}")
         if "Chat not found" in str(e):
             logger.error("Проверьте правильность TELEGRAM_CHAT_ID")
+        raise
     except Exception as e:
         logger.error(f"Критическая ошибка: {e}", exc_info=True)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"🚨 Произошла ошибка: {str(e)}"
-        )
+        raise
+
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /report"""
-    await send_report_to_chat(context, update.effective_chat.id)
+    try:
+        await send_report_to_chat(context, update.effective_chat.id)
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"🚨 Не удалось отправить отчет после 3 попыток: {str(e)}"
+        )
 
 
 async def daily_report(context: CallbackContext):
     """Ежедневная отправка отчета"""
-    await send_report_to_chat(context, TELEGRAM_CHAT_ID)
+    try:
+        await send_report_to_chat(context, TELEGRAM_CHAT_ID)
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=f"🚨 Не удалось отправить отчет после 3 попыток: {str(e)}"
+        )
+
+
+async def main_async():
+    """Асинхронная основная функция"""
+    application = None
+    try:
+        application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+        # Отправляем отчет
+        await send_report_to_chat(application, TELEGRAM_CHAT_ID)
+
+        # Останавливаем приложение
+        if application.running:
+            await application.stop()
+            await application.shutdown()
+
+    except Exception as e:
+        logger.error(f"Ошибка при выполнении: {e}")
+
+        # Пытаемся отправить сообщение об ошибке, если приложение создано
+        if application and hasattr(application, 'bot'):
+            try:
+                await application.bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=f"🚨 Не удалось отправить отчет после 3 попыток: {str(e)}"
+                )
+            except Exception as bot_error:
+                logger.error(f"Не удалось отправить сообщение об ошибке: {bot_error}")
+
+        # Завершаем приложение если оно создано
+        if application and application.running:
+            try:
+                await application.stop()
+                await application.shutdown()
+            except Exception:
+                pass
+
+        exit(1)
 
 
 def main():
     """Запуск бота для одноразовой отправки отчета"""
     try:
-        application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        loop.run_until_complete(send_report_to_chat(application, TELEGRAM_CHAT_ID))
-
-        application.stop()
-        application.shutdown()
-
+        # Создаем новый цикл событий и запускаем асинхронную функцию
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        logger.info("Работа прервана пользователем")
     except Exception as e:
-        logger.error(f"Ошибка при выполнении: {e}")
+        logger.error(f"Непредвиденная ошибка: {e}")
         exit(1)
 
 
